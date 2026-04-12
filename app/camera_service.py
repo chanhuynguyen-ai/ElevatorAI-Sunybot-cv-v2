@@ -52,6 +52,7 @@ class CameraService:
             "fps": 0.0,
             "people_count": 0,
             "unknown_count": 0,
+            "sitting_count": 0,
             "lying_count": 0,
             "fall_count": 0,
             "overload": False,
@@ -85,10 +86,12 @@ class CameraService:
     def _build_runtime_inside_thread(self):
         if config.CV_BACKEND == "trt":
             from app.runtime_trt import DetectorTRT, PoseTRT
+
             self.detector = DetectorTRT()
             self.pose_model = PoseTRT() if config.ENABLE_POSE else None
         else:
             from app.runtime_ultra import DetectorUltra, PoseUltra
+
             self.detector = DetectorUltra()
             self.pose_model = PoseUltra() if config.ENABLE_POSE else None
 
@@ -123,7 +126,17 @@ class CameraService:
             2,
         )
 
-    def _log_event(self, event_type, track_id=None, bbox=None, posture=None, people_count=None, person_name=None, confidence=None, extra=None):
+    def _log_event(
+        self,
+        event_type,
+        track_id=None,
+        bbox=None,
+        posture=None,
+        people_count=None,
+        person_name=None,
+        confidence=None,
+        extra=None,
+    ):
         self.logger.log_event(
             cam_id=config.CAMERA_ID,
             event_type=event_type,
@@ -137,6 +150,15 @@ class CameraService:
             snapshot_path=None,
             extra=extra or {},
         )
+
+    def _posture_confirm_frames(self, posture: str) -> int:
+        if posture == "lying":
+            return max(1, config.LYING_CONFIRM_FRAMES)
+        if posture == "sitting":
+            return max(1, config.SITTING_CONFIRM_FRAMES)
+        if posture == "unknown":
+            return max(1, config.POSTURE_CONFIRM_UNKNOWN_FRAMES)
+        return 1
 
     def _run_loop(self):
         last_fps_ts = time.time()
@@ -176,7 +198,7 @@ class CameraService:
                 fps_count += 1
 
                 if time.time() - last_fps_ts >= 1.0:
-                    self.status["fps"] = fps_count / (time.time() - last_fps_ts)
+                    self.status["fps"] = fps_count / max(time.time() - last_fps_ts, 1e-6)
                     fps_count = 0
                     last_fps_ts = time.time()
 
@@ -198,11 +220,12 @@ class CameraService:
                         score = iou_xyxy(pose["bbox"], tb)
                         if score > best_iou:
                             best_tid, best_iou = tid, score
-                    if best_tid is not None and best_iou >= 0.2:
+                    if best_tid is not None and best_iou >= 0.25:
                         pose_by_track[best_tid] = pose
 
                 people_count = len(track_assignments)
                 unknown_count = 0
+                sitting_count = 0
                 lying_count = 0
                 fall_count = 0
 
@@ -239,17 +262,21 @@ class CameraService:
                             "posture": "unknown",
                             "posture_candidate": "unknown",
                             "candidate_streak": 0,
-                            "lying_streak": 0,
-                            "fall_streak": 0,
                             "last_upright_ts": now_ts,
                             "danger_until": 0.0,
                             "person_name": None,
+                            "last_center": None,
+                            "last_motion_ts": now_ts,
+                            "posture_meta": {},
                         },
                     )
 
                     candidate_posture = "unknown"
+                    posture_meta = {"ok": False, "reason": "no_pose"}
                     if tid in pose_by_track:
-                        candidate_posture = classify_posture(pose_by_track[tid]["keypoints"], bbox)
+                        candidate_posture, posture_meta = classify_posture(
+                            pose_by_track[tid]["keypoints"], bbox, return_meta=True
+                        )
 
                     if candidate_posture == state["posture_candidate"]:
                         state["candidate_streak"] += 1
@@ -258,34 +285,47 @@ class CameraService:
                         state["candidate_streak"] = 1
 
                     confirmed_posture = state["posture"]
+                    if candidate_posture != "unknown" and state["candidate_streak"] >= self._posture_confirm_frames(candidate_posture):
+                        confirmed_posture = candidate_posture
+                    elif candidate_posture == "unknown" and state["candidate_streak"] >= self._posture_confirm_frames("unknown"):
+                        confirmed_posture = state["posture"]
 
-                    if candidate_posture == "standing" and state["candidate_streak"] >= 1:
-                        confirmed_posture = "standing"
-                        state["lying_streak"] = 0
-                        state["fall_streak"] = 0
+                    prev_posture = state["posture"]
+                    state["posture"] = confirmed_posture
+                    state["posture_meta"] = posture_meta
+
+                    x1, y1, x2, y2 = bbox
+                    center = ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
+                    prev_center = state.get("last_center")
+                    prev_motion_ts = state.get("last_motion_ts", now_ts)
+                    dt = max(now_ts - prev_motion_ts, 1e-3)
+                    center_drop_ratio = 0.0
+                    vertical_speed = 0.0
+                    if prev_center is not None:
+                        center_drop = max(center[1] - prev_center[1], 0.0)
+                        center_drop_ratio = center_drop / max(float(y2 - y1), 1.0)
+                        vertical_speed = center_drop / dt
+
+                    state["last_center"] = center
+                    state["last_motion_ts"] = now_ts
+
+                    if confirmed_posture in {"standing", "sitting"}:
                         state["last_upright_ts"] = now_ts
 
-                    elif candidate_posture == "lying":
-                        state["lying_streak"] += 1
-                        if state["lying_streak"] >= config.LYING_CONFIRM_FRAMES:
-                            confirmed_posture = "lying"
-
-                            if now_ts - state["last_upright_ts"] <= config.FALL_MAX_TRANSITION_SEC:
-                                state["fall_streak"] += 1
-                            else:
-                                state["fall_streak"] = 0
-                        else:
-                            # chua confirm lying thi giu posture cu
-                            confirmed_posture = state["posture"]
-
-                    state["posture"] = confirmed_posture
-
                     is_danger = False
+                    event_extra = {
+                        "posture_metrics": posture_meta,
+                        "center_drop_ratio": round(center_drop_ratio, 3),
+                        "vertical_speed": round(vertical_speed, 2),
+                    }
 
-                    if confirmed_posture == "lying":
+                    if confirmed_posture == "unknown":
+                        unknown_count += 1
+                    elif confirmed_posture == "sitting":
+                        sitting_count += 1
+                    elif confirmed_posture == "lying":
                         lying_count += 1
                         is_danger = True
-
                         if self._event_ready(("LYING", tid)):
                             self._log_event(
                                 "LYING",
@@ -293,16 +333,24 @@ class CameraService:
                                 bbox=bbox,
                                 posture=confirmed_posture,
                                 people_count=people_count,
+                                confidence=posture_meta.get("posture_confidence"),
+                                extra=event_extra,
                             )
 
-                    if (
+                    fall_gate = (
                         confirmed_posture == "lying"
-                        and state["fall_streak"] >= config.FALL_CONFIRM_FRAMES
-                    ):
+                        and is_fall_transition(prev_posture, confirmed_posture)
+                        and (
+                            center_drop_ratio >= config.FALL_MIN_CENTER_DROP_RATIO
+                            or vertical_speed >= config.FALL_MIN_VERTICAL_SPEED
+                            or now_ts - state["last_upright_ts"] <= config.FALL_MAX_TRANSITION_SEC
+                        )
+                    )
+
+                    if fall_gate:
                         fall_count += 1
                         is_danger = True
                         state["danger_until"] = now_ts + config.DANGER_HOLD_SEC
-
                         if self._event_ready(("FALL", tid)):
                             self._log_event(
                                 "FALL",
@@ -310,16 +358,20 @@ class CameraService:
                                 bbox=bbox,
                                 posture=confirmed_posture,
                                 people_count=people_count,
+                                confidence=posture_meta.get("posture_confidence"),
+                                extra=event_extra,
                             )
-
-                        state["fall_streak"] = 0
 
                     if now_ts < state["danger_until"]:
                         is_danger = True
 
                     person_name = state["person_name"] or ("track:%s" % tid)
+                    posture_conf = posture_meta.get("posture_confidence")
+                    posture_text = confirmed_posture
+                    if posture_conf is not None:
+                        posture_text = "%s %.2f" % (confirmed_posture, posture_conf)
                     color = (0, 0, 255) if is_danger else (0, 255, 0)
-                    self._draw_box(frame, bbox, "%s | %s" % (person_name, confirmed_posture), color)
+                    self._draw_box(frame, bbox, "%s | %s" % (person_name, posture_text), color)
 
                 for _, bottle_bbox in bottle_assignments:
                     self._draw_box(frame, bottle_bbox, "bottle", (0, 140, 255))
@@ -337,6 +389,7 @@ class CameraService:
 
                 self.status["people_count"] = people_count
                 self.status["unknown_count"] = unknown_count
+                self.status["sitting_count"] = sitting_count
                 self.status["lying_count"] = lying_count
                 self.status["fall_count"] = fall_count
 
@@ -352,6 +405,7 @@ class CameraService:
                             "fps": self.status["fps"],
                             "overload": overload,
                             "overload_threshold": config.OVERLOAD_THRESHOLD,
+                            "sitting_count": sitting_count,
                         },
                     )
 
@@ -403,5 +457,3 @@ class CameraService:
 
     def get_status(self):
         return self.status
-
-
